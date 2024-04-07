@@ -1,0 +1,1 @@
+A very simple neural network implementation in Odin for educational purposes, currently a very simple XOR solver.

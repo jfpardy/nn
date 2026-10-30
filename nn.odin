@@ -1,131 +1,126 @@
-package nn;
+package nn
+
 import "core:math"
 import "core:math/rand"
-import "core:fmt"
-import "core:io"
 
-numInput :: 2;
-numHiddenNodes :: 2;
-numOutputs :: 1;
-numTrainingSets :: 4;
+// A very small fully connected network: inputs -> one sigmoid hidden layer
+// -> outputs. Sizes are compile-time, everything is fixed arrays, nothing
+// allocates. Training is plain per-sample gradient descent (backprop), with
+// optional L2 weight decay and per-output masks for missing targets.
 
-init_weight :: proc()->f64{
-    return rand.float64_range(0,1)
+Output_Kind :: enum {
+	Sigmoid, // outputs in 0..1, e.g. classification like XOR
+	Linear, // outputs unbounded, for regression
 }
 
-sigmoid :: proc(x:f64)->f64{
-    return 1/(1+math.exp(-x))
+Net :: struct($IN, $HID, $OUT: int) {
+	output_kind: Output_Kind,
+
+	hiddenWeights: [IN][HID]f64,
+	hiddenBias:    [HID]f64,
+	outputWeights: [HID][OUT]f64,
+	outputBias:    [OUT]f64,
+
+	// Activations from the last forward pass, used by backprop.
+	hiddenLayer: [HID]f64,
+	outputLayer: [OUT]f64,
 }
-dsigmoid :: proc(x:f64)->f64{
-    return x * (1-x)
+
+sigmoid :: proc(x: f64) -> f64 {
+	return 1 / (1 + math.exp(-x))
 }
 
+// Derivative of the sigmoid, given its output (not its input).
+dsigmoid :: proc(y: f64) -> f64 {
+	return y * (1 - y)
+}
 
-main :: proc() {
-    lr :f64 = 0.05;
-    hiddenLayer :[numHiddenNodes]f64;
-    outputLayer :[numOutputs]f64;
+// Small weights centred on zero (+-1/sqrt(fan in)), zero biases.
+net_init :: proc(net: ^Net($IN, $HID, $OUT), kind: Output_Kind, gen := context.random_generator) {
+	net^ = {}
+	net.output_kind = kind
+	hidden_range := 1 / math.sqrt(f64(IN))
+	for i in 0 ..< IN {
+		for j in 0 ..< HID {
+			net.hiddenWeights[i][j] = rand.float64_range(-hidden_range, hidden_range, gen)
+		}
+	}
+	output_range := 1 / math.sqrt(f64(HID))
+	for i in 0 ..< HID {
+		for j in 0 ..< OUT {
+			net.outputWeights[i][j] = rand.float64_range(-output_range, output_range, gen)
+		}
+	}
+}
 
-    hiddenLayerBias:[numHiddenNodes]f64;
-    outputLayerBias:[numOutputs]f64;
+net_forward :: proc(net: ^Net($IN, $HID, $OUT), input: [IN]f64) -> [OUT]f64 {
+	// Hidden layer activation
+	for j in 0 ..< HID {
+		activation := net.hiddenBias[j]
+		for k in 0 ..< IN {
+			activation += input[k] * net.hiddenWeights[k][j]
+		}
+		net.hiddenLayer[j] = sigmoid(activation)
+	}
+	// Output activation
+	for j in 0 ..< OUT {
+		activation := net.outputBias[j]
+		for k in 0 ..< HID {
+			activation += net.hiddenLayer[k] * net.outputWeights[k][j]
+		}
+		net.outputLayer[j] = net.output_kind == .Sigmoid ? sigmoid(activation) : activation
+	}
+	return net.outputLayer
+}
 
-    hiddenWeights:[numInput][numHiddenNodes]f64;
-    outputWeights:[numHiddenNodes][numOutputs]f64;
+// One step of backprop on a single sample. Outputs with mask[j] == false have
+// no target and contribute no error. `l2` decays every weight a little each
+// step (biases are left alone). Returns the squared error of the masked outputs.
+net_train_step :: proc(
+	net: ^Net($IN, $HID, $OUT),
+	input: [IN]f64,
+	target: [OUT]f64,
+	mask: [OUT]bool,
+	lr: f64,
+	l2: f64 = 0,
+) -> (sq_error: f64) {
+	net_forward(net, input)
 
-    training_inputs :[numTrainingSets][numInput]f64={{0.0,0.0},{1.0,0.0},{0.0,1.0},{1.0,1.0}};
-    training_outputs :[numTrainingSets][numOutputs]f64={{0.0},{1.0},{1.0},{0.0}};
-    
-    for i:= 0; i < numInput; i+=1 {
-        for j:=0; j <numHiddenNodes; j+=1 {
-            hiddenWeights[i][j] = init_weight();
-        }
-    } 
+	// Change in output
+	deltaOutput: [OUT]f64
+	for j in 0 ..< OUT {
+		if !mask[j] do continue
+		error := target[j] - net.outputLayer[j]
+		sq_error += error * error
+		deltaOutput[j] = net.output_kind == .Sigmoid ? error * dsigmoid(net.outputLayer[j]) : error
+	}
 
-    for i:= 0; i < numHiddenNodes; i+=1 {
-        for j:=0; j <numOutputs; j+=1 {
-            outputWeights[i][j] = init_weight();
-        }
-    } 
+	// Change in hidden layer
+	deltaHidden: [HID]f64
+	for j in 0 ..< HID {
+		error := 0.0
+		for k in 0 ..< OUT {
+			error += deltaOutput[k] * net.outputWeights[j][k]
+		}
+		deltaHidden[j] = error * dsigmoid(net.hiddenLayer[j])
+	}
 
-    for i:= 0; i <numOutputs; i+=1 {
-        outputLayerBias[i] = init_weight();
-    }
+	decay := 1 - lr * l2
 
-
-    trainingSetOrder :[]int = {0,1,2,3}
-
-
-    numberOfEpochs := 100000;
-
-    //Training loop
-    for epoch:int=0; epoch <numberOfEpochs; epoch +=1 {
-        rand.shuffle(trainingSetOrder)
-        for x:=0; x <numTrainingSets; x +=1 {
-            i:= trainingSetOrder[x]
-
-            //forward pass
-
-            //Hidden layer activation
-            for j:=0; j < numHiddenNodes; j+=1 {
-                activation := hiddenLayerBias[j]
-                
-                for k:=0; k < numInput; k+=1 {
-                    activation += training_inputs[i][k] * hiddenWeights[k][j]
-                }
-
-                hiddenLayer[j] = sigmoid(activation);
-            }
-            //Output Activation
-            for j:=0; j < numOutputs; j+=1 {
-                activation := outputLayerBias[j]
-                
-                for k:=0; k < numHiddenNodes; k+=1 {
-                    activation += hiddenLayer[k] * outputWeights[k][j]
-                }
-
-                outputLayer[j] = sigmoid(activation);
-            }
-            //fmt.printf("Forward Pass:\n Input: %g %g \n Output: %g \n Expected Output: %g \n",training_inputs[i][0],training_inputs[i][1],outputLayer[0],
-            //training_outputs[i][0]);
-            if(epoch%%1000 == 0 ){
-            fmt.printf("%g \n", outputLayer[0] - training_outputs[i][0])
-        }
-            //Backprop
-            
-            //Change in output
-
-            deltaOutput : [numOutputs]f64;
-            for j:=0; j < numOutputs; j+=1 {
-                error: f64 = (training_outputs[i][j] - outputLayer[j]);
-                deltaOutput[j] = error * dsigmoid(outputLayer[j])
-            }
-
-            //compute change in hidden weight
-            deltaHidden :[numHiddenNodes]f64;
-            for j:=0; j < numHiddenNodes; j+=1 {
-                error: f64 = 0.0;
-                for k:= 0; k<numOutputs; k+=1 {
-                    error += deltaOutput[k]* outputWeights[j][k];
-                }
-                deltaHidden[j] = error * dsigmoid(hiddenLayer[j]);
-            }
-            // Apply the changes in output weights
-            for j:=0; j < numOutputs; j+=1 {
-                outputLayerBias[j] += deltaOutput[j] * lr
-                for k:=0; k< numHiddenNodes; k+=1 {
-                    outputWeights[k][j] += hiddenLayer[k] * deltaOutput[j] * lr
-                }
-            }
-            // Apply the changes in hidden weights
-            for j:=0; j < numHiddenNodes; j+=1 {
-                hiddenLayerBias[j] += deltaHidden[j] * lr
-                for k:=0; k< numInput; k+=1 {
-                    hiddenWeights[k][j] += training_inputs[i][k] * deltaHidden[j] * lr
-                }
-            }
-
-        }
-        
-    }
-
+	// Apply the changes in output weights. A masked output still decays, but
+	// only through l2; its weights get no gradient.
+	for j in 0 ..< OUT {
+		net.outputBias[j] += deltaOutput[j] * lr
+		for k in 0 ..< HID {
+			net.outputWeights[k][j] = net.outputWeights[k][j] * decay + net.hiddenLayer[k] * deltaOutput[j] * lr
+		}
+	}
+	// Apply the changes in hidden weights
+	for j in 0 ..< HID {
+		net.hiddenBias[j] += deltaHidden[j] * lr
+		for k in 0 ..< IN {
+			net.hiddenWeights[k][j] = net.hiddenWeights[k][j] * decay + input[k] * deltaHidden[j] * lr
+		}
+	}
+	return
 }
